@@ -678,7 +678,7 @@ func (k *Kind) installDefaultCa(ctx context.Context) (err error) {
 		Version: "v1alpha1",
 		Kind:    "Bundle",
 	})
-	bundle.SetName(fmt.Sprintf("%s.crt", defaultBundleName))
+	bundle.SetName(defaultBundleName)
 	bundle.Object["spec"] = map[string]any{
 		"sources": []any{
 			map[string]any{
@@ -691,6 +691,22 @@ func (k *Kind) installDefaultCa(ctx context.Context) (err error) {
 		"target": map[string]any{
 			"configMap": map[string]any{
 				"key": defaultBundleFile,
+			},
+			"namespaceSelector": map[string]any{
+				"matchExpressions": []any{
+					map[string]any{
+						"key":      "kubernetes.io/metadata.name",
+						"operator": "NotIn",
+						"values": []string{
+							"cert-manager",
+							"kube-node-lease",
+							"kube-public",
+							"kube-system",
+							"kube-system",
+							"local-path-storage",
+						},
+					},
+				},
 			},
 		},
 	}
@@ -797,9 +813,9 @@ func (k *Kind) installCrdFiles(ctx context.Context) error {
 // Name of objects related to the default CA:
 const (
 	defaultBundleFile   = "bundle.pem"
-	defaultBundleName   = "default"
+	defaultBundleName   = "ca-bundle"
 	defaultCaCommonName = "Default CA"
-	defaultCaIssuerName = "default"
+	defaultCaIssuerName = "default-ca"
 	defaultCaSecretName = "default-ca"
 )
 
