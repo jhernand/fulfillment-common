@@ -219,6 +219,18 @@ func (k *Kind) Start(ctx context.Context) error {
 		return fmt.Errorf("failed to install CA certificate: %w", err)
 	}
 
+	// Install Envoy gateway:
+	err = k.installEnvoyGateway(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to install Envoy Gateway: %w", err)
+	}
+
+	// Install default gateway:
+	err = k.installDefaultGateway(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to install default gateway: %w", err)
+	}
+
 	// Install authorino:
 	err = k.installAuthorino(ctx)
 	if err != nil {
@@ -434,13 +446,8 @@ func (k *Kind) createCluster(ctx context.Context) error {
 				"role": "control-plane",
 				"extraPortMappings": []any{
 					map[string]any{
-						"containerPort": 30000,
-						"hostPort":      8000,
-						"listenAddress": "0.0.0.0",
-					},
-					map[string]any{
-						"containerPort": 30001,
-						"hostPort":      8001,
+						"containerPort": internalIngressPort,
+						"hostPort":      externalIngressPort,
 						"listenAddress": "0.0.0.0",
 					},
 				},
@@ -646,13 +653,10 @@ func (k *Kind) installTrustManager(ctx context.Context) (err error) {
 	if err != nil {
 		return fmt.Errorf("failed to install trust-manager: %w", err)
 	}
-
-	// Wait for custom resource definition to be available:
 	err = k.waitForCrd(ctx, "bundle.yaml", time.Minute)
 	if err != nil {
 		return fmt.Errorf("failed to wait for bundle CRD: %w", err)
 	}
-
 	k.logger.DebugContext(ctx, "Installed trust-manager")
 	return nil
 }
@@ -860,6 +864,93 @@ func (k *Kind) installAuthorino(ctx context.Context) (err error) {
 	return nil
 }
 
+func (k *Kind) installEnvoyGateway(ctx context.Context) (err error) {
+	k.logger.DebugContext(ctx, "Installing Envoy Gateway")
+	installCmd, err := NewCommand().
+		SetLogger(k.logger).
+		SetName(helmCmd).
+		SetArgs(
+			"install",
+			"envoy-gateway",
+			"oci://docker.io/envoyproxy/gateway-helm",
+			"--version", envoyGatewayVersion,
+			"--kubeconfig", k.kubeconfigFile,
+			"--namespace", "envoy-gateway-system",
+			"--create-namespace",
+			"--set", "service.type=NodePort",
+			"--set", fmt.Sprintf("service.nodePort=%d", internalIngressPort),
+			"--wait",
+		).
+		Build()
+	if err != nil {
+		return fmt.Errorf("failed to create command to install Envoy Gateway: %w", err)
+	}
+	err = installCmd.Execute(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to install Envoy Gateway: %w", err)
+	}
+	err = k.waitForCrd(ctx, "gatewayclass.yaml", time.Minute)
+	if err != nil {
+		return fmt.Errorf("failed to wait for GatewayClass CRD: %w", err)
+	}
+	err = k.waitForCrd(ctx, "gateway.yaml", time.Minute)
+	if err != nil {
+		return fmt.Errorf("failed to wait for Gateway CRD: %w", err)
+	}
+	err = k.waitForCrd(ctx, "httproute.yaml", time.Minute)
+	if err != nil {
+		return fmt.Errorf("failed to wait for HTTPRoute CRD: %w", err)
+	}
+	k.logger.DebugContext(ctx, "Installed Envoy Gateway")
+	return nil
+}
+
+func (k *Kind) installDefaultGateway(ctx context.Context) (err error) {
+	// Create the default gateway class:
+	k.logger.DebugContext(ctx, "Creating default gateway class")
+	gatewayClass := &unstructured.Unstructured{}
+	gatewayClass.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "gateway.networking.k8s.io",
+		Version: "v1",
+		Kind:    "GatewayClass",
+	})
+	gatewayClass.SetName("default")
+	gatewayClass.Object["spec"] = map[string]any{
+		"controllerName": "gateway.envoyproxy.io/gatewayclass-controller",
+	}
+	err = k.kubeClient.Create(ctx, gatewayClass)
+	if err != nil {
+		return fmt.Errorf("failed to create default GatewayClass: %w", err)
+	}
+
+	// Create the default gateway:
+	k.logger.DebugContext(ctx, "Creating default gateway")
+	gateway := &unstructured.Unstructured{}
+	gateway.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "gateway.networking.k8s.io",
+		Version: "v1",
+		Kind:    "Gateway",
+	})
+	gateway.SetNamespace("default")
+	gateway.SetName("default")
+	gateway.Object["spec"] = map[string]any{
+		"gatewayClassName": "default",
+		"listeners": []any{
+			map[string]any{
+				"name":     "http",
+				"protocol": "HTTP",
+				"port":     80,
+			},
+		},
+	}
+	err = k.kubeClient.Create(ctx, gateway)
+	if err != nil {
+		return fmt.Errorf("failed to create default Gateway: %w", err)
+	}
+
+	return nil
+}
+
 func (k *Kind) installCrdFiles(ctx context.Context) error {
 	for _, crdFile := range k.crdFiles {
 		logger := k.logger.With(slog.String("file", crdFile))
@@ -949,6 +1040,15 @@ const (
 	kubectlCmd = "kubectl"
 )
 
+// host ingress port is the port number on the host machine that maps to the internal ingress port. Traffic arriving on
+// this port on the host will be forwarded to the internal ingress port in the cluster.
+const externalIngressPort = 8000
+
+// internalIngressPort is the port number used internally in the Kubernetes cluster for ingress traffic. This is the
+// node port that Envoy Gateway's service will use, and it is also the container port mapped in the Kind cluster
+// configuration.
+const internalIngressPort = 30000
+
 // Location of manifests and charts:
 const (
 	certManagerVersion  = "v1.19.1"
@@ -956,4 +1056,5 @@ const (
 	authorinoVersion    = "v0.22.0"
 	authorinoManifests  = "https://raw.githubusercontent.com/Kuadrant/authorino-operator/refs/heads/release-" +
 		authorinoVersion + "/config/deploy/manifests.yaml"
+	envoyGatewayVersion = "v1.6.0"
 )
